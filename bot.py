@@ -1,5 +1,5 @@
-# bot.py — yt-dlp only + Google Cloud Storage (GCS) uploader
-import os, re, json, time, asyncio, pathlib, random, string, mimetypes, datetime
+# bot.py — yt-dlp only + Google Cloud Storage (GCS) uploader with GCP_SERVICE_ACCOUNT_B64
+import os, re, json, time, asyncio, pathlib, random, string, mimetypes, datetime, base64
 from typing import List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -27,8 +27,10 @@ GCS_PUBLIC_BASE = (os.getenv("GCS_PUBLIC_BASE", "") or "").rstrip("/")  # ถ้
 GCS_LINK_MODE = (os.getenv("GCS_LINK_MODE") or "presign").lower()       # "presign" | "public"
 GCS_TTL_SECONDS = max(0, int(os.getenv("GCS_TTL_SECONDS", "3600")))     # อายุลิงก์/เวลาลบ (วินาที) 0 = ไม่ตั้งเวลาลบ
 
-GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
-GCS_CREDENTIALS_JSON = os.getenv("GCS_CREDENTIALS_JSON")  # JSON ทั้งก้อนใน env (ทางเลือก)
+# วิธี auth GCP (เลือกอย่างใดอย่างหนึ่ง)
+GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")  # path file (ถ้ามี)
+GCS_CREDENTIALS_JSON = os.getenv("GCS_CREDENTIALS_JSON")                          # วาง JSON ทั้งก้อนใน env
+GCP_SERVICE_ACCOUNT_B64 = os.getenv("GCP_SERVICE_ACCOUNT_B64")                    # base64 ของ JSON
 
 # ใช้ allowlist ห้อง/เธรด (ไฟล์แยกก็ได้)
 try:
@@ -51,7 +53,6 @@ DEFAULT_HEADERS = {
 }
 
 # ---------- Blocked domains (TOS/DRM risk) ----------
-# หมายเหตุ: ไม่ควรบล็อก YouTube ถ้าต้องการใช้ yt-dlp
 BLOCKED_DOMAINS = {
     "netflix.com", "disneyplus.com", "primevideo.com", "hulu.com",
     "max.com", "paramountplus.com", "peacocktv.com", "tv.apple.com",
@@ -130,11 +131,18 @@ def _get_gcs_client() -> storage.Client:
     global _GCS_CLIENT
     if _GCS_CLIENT is not None:
         return _GCS_CLIENT
+
+    # ลำดับความสำคัญ: GCS_CREDENTIALS_JSON > GCP_SERVICE_ACCOUNT_B64 > GOOGLE_APPLICATION_CREDENTIALS/ADC
     if GCS_CREDENTIALS_JSON:
         info = json.loads(GCS_CREDENTIALS_JSON)
         creds = service_account.Credentials.from_service_account_info(info)
         _GCS_CLIENT = storage.Client(credentials=creds, project=creds.project_id)
+    elif GCP_SERVICE_ACCOUNT_B64:
+        info = json.loads(base64.b64decode(GCP_SERVICE_ACCOUNT_B64).decode("utf-8"))
+        creds = service_account.Credentials.from_service_account_info(info)
+        _GCS_CLIENT = storage.Client(credentials=creds, project=creds.project_id)
     else:
+        # ใช้ ADC: GOOGLE_APPLICATION_CREDENTIALS หรือ metadata server
         _GCS_CLIENT = storage.Client()
     return _GCS_CLIENT
 
