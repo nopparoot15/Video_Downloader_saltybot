@@ -1,5 +1,4 @@
-# bot.py (patched)
-import os, re, pathlib, asyncio, time, random, string
+import os, re, pathlib, asyncio, time, random, string, mimetypes
 from typing import List, Optional, Tuple
 from dataclasses import dataclass
 from urllib.parse import urlparse, urljoin
@@ -11,6 +10,10 @@ from discord.ext import commands
 # ========== ENV ==========
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 MAX_DISCORD_BYTES = int(os.getenv("UPLOAD_LIMIT_BYTES", str(24 * 1024 * 1024)))
+
+# ขนาดสูงสุดที่ยอมดาวน์โหลดล่วงหน้าถ้าไม่ได้ตั้ง S3 (กันดิสก์แตก)
+MAX_FETCH_MB = int(os.getenv("MAX_FETCH_MB", "350"))
+MAX_FETCH_BYTES = MAX_FETCH_MB * 1024 * 1024
 
 # S3 (อัปไฟล์ใหญ่เกินลิมิตแนบไฟล์)
 S3_BUCKET = os.getenv("S3_BUCKET", "")
@@ -28,14 +31,13 @@ except Exception:
 # ========== Discord ==========
 INTENTS = discord.Intents.default()
 INTENTS.message_content = True
-bot = commands.Bot(command_prefix="!", intents=INTENTS)
+COMMAND_PREFIXES = tuple((os.getenv("COMMAND_PREFIXES") or "!").split(","))  # กันยิงซ้ำกับ on_message
+bot = commands.Bot(command_prefix=COMMAND_PREFIXES[0], intents=INTENTS)
 
 DOWNLOAD_DIR = pathlib.Path("downloads")
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 VIDEO_EXTS = {".mp4", ".mov", ".webm", ".mkv", ".m4v", ".ts"}
-HLS_EXTS = {".m3u8"}
-source_page = url
 
 DEFAULT_HEADERS = {
     "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
@@ -126,7 +128,8 @@ def s3_upload(local_path: pathlib.Path) -> str:
         region_name=S3_REGION,
     )
     s3 = session.client("s3")
-    s3.upload_file(str(local_path), S3_BUCKET, key, ExtraArgs={"ACL": "public-read"})
+    ct = mimetypes.guess_type(local_path.name)[0] or "application/octet-stream"
+    s3.upload_file(str(local_path), S3_BUCKET, key, ExtraArgs={"ACL": "public-read", "ContentType": ct})
     return f"{S3_PUBLIC_BASE}/{key}"
 
 async def http_head_ok(url: str, referer: Optional[str] = None) -> Tuple[str, int]:
@@ -218,7 +221,7 @@ def parse_hls_master(text: str, base_url: str) -> List[HlsVariant]:
     return variants
 
 async def download_hls_to_mp4(m3u8_url: str, out_path: pathlib.Path):
-    text = await fetch_text(m3u8_url)  # ตรวจ KEY ก่อน
+    text = await fetch_text(m3u8_url)
     if hls_is_encrypted(text):
         raise NotAllowed("พบการเข้ารหัสใน .m3u8 (DRM/KEY) — ไม่รองรับ")
 
@@ -246,31 +249,29 @@ async def download_hls_to_mp4(m3u8_url: str, out_path: pathlib.Path):
         msg = (e2 or e1).decode(errors="ignore")[:300]
         raise FetchError(f"ffmpeg failed: {msg}")
 
-# ดึงลิงก์จาก JSON/สคริปต์ยอดฮิต
+# ---------- HTML candidates ----------
+# ดึงลิงก์จาก JSON/สคริปต์ยอดฮิต + fallback ครอบคลุม schemeless/relative
 JSON_URL_RE = re.compile(
-    r'(?:"|\'|)(?:file|src|url)(?:"|\'|)\s*:\s*["\'](https?://[^\s"\']+\.(?:m3u8|mp4|webm|mov)(?:\?[^\s"\']*)?)["\']',
+    r'(?:"|\')?(?:file|src|url)(?:"|\')?\s*:\s*["\']((?:https?:)?//[^\s"\']+?\.(?:m3u8|mp4|webm|mov)(?:\?[^\s"\']*)?|/[^\s"\']+?\.(?:m3u8|mp4|webm|mov)(?:\?[^\s"\']*)?)["\']',
     re.I
 )
 JSON_SOURCES_RE = re.compile(
-    r'sources?\s*:\s*\[\s*{[^{}]*?src\s*:\s*["\'](https?://[^\s"\']+\.(?:m3u8|mp4|webm|mov)(?:\?[^\s"\']*)?)["\']',
+    r'sources?\s*:\s*\[\s*{[^{}]*?src\s*:\s*["\']((?:https?:)?//[^\s"\']+?\.(?:m3u8|mp4|webm|mov)(?:\?[^\s"\']*)?|/[^\s"\']+?\.(?:m3u8|mp4|webm|mov)(?:\?[^\s"\']*)?)["\']',
     re.I | re.S
 )
-# ยิงกว้างทั่วทั้งเอกสาร (fallback)
 FALLBACK_MEDIA_URL_RE = re.compile(
-    r'https?://[^\s"\'<>]+?\.(?:m3u8|mp4|webm|mov)(?:\?[^\s"\'<>]*)?',
+    r'((?:https?:)?//[^\s"\'<>]+?\.(?:m3u8|mp4|webm|mov)(?:\?[^\s"\'<>]*)?|/[^\s"\'<>]+?\.(?:m3u8|mp4|webm|mov)(?:\?[^\s"\'<>]*)?)',
     re.I
 )
 
 def _normalize_url(u: str, base_url: str) -> str:
     u = (u or "").strip()
     if u.startswith("//"):
-        # เติม scheme ให้ URL แบบ schemeless
         u = ("https:" if base_url.lower().startswith("https") else "http:") + u
     if not urlparse(u).scheme:
         u = urljoin(base_url, u)
     return u
 
-# ---------- HTML candidates ----------
 VIDEO_CANDIDATE_PATTERNS = [
     r'<meta[^>]+property=["\']og:video["\'][^>]+content=["\']([^"\']+)["\']',
     r'<meta[^>]+property=["\']og:video:url["\'][^>]+content=["\']([^"\']+)["\']',
@@ -284,24 +285,23 @@ def find_video_candidates(html: str, base_url: str) -> List[str]:
     html = html or ""
     urls: List[str] = []
 
-    # 2.1 วิธีเดิม: meta/video/source/link (ดีแล้ว เก็บไว้)
+    # เดิม: meta/video/source/link
     for pat in VIDEO_CANDIDATE_PATTERNS:
         for m in re.finditer(pat, html, flags=re.I):
             u = (m.group(1) or "").strip()
-            if not u:
-                continue
-            urls.append(_normalize_url(u, base_url))
+            if u:
+                urls.append(_normalize_url(u, base_url))
 
-    # 2.2 เพิ่ม: JSON/สคริปต์ยอดฮิต (sources/file/src/url)
+    # JSON/สคริปต์ยอดฮิต
     for rx in (JSON_URL_RE, JSON_SOURCES_RE):
         for m in rx.finditer(html):
             u = (m.group(1) or "").strip()
             if u:
                 urls.append(_normalize_url(u, base_url))
 
-    # 2.3 Fallback: ยิงกว้างหา .m3u8/.mp4 ทั้งเอกสาร
+    # Fallback: ยิงกว้างทั้งเอกสาร
     for m in FALLBACK_MEDIA_URL_RE.finditer(html):
-        u = (m.group(0) or "").strip()
+        u = (m.group(1) or "").strip()
         if u:
             urls.append(_normalize_url(u, base_url))
 
@@ -356,18 +356,18 @@ async def resolve_public_video(url: str):
 
     # 3) HTML → หาคลู่วิดีโอ
     try:
-        html = await fetch_text(url)  # ← ไม่ต้อง referer ที่นี่
+        html = await fetch_text(url)
         cands = find_video_candidates(html, base_url=url)
         for cu in cands:
             h2 = hostof(cu)
             if is_blocked_host(h2):
                 raise NotAllowed("โดเมนนี้ไม่รองรับ (เสี่ยง TOS/DRM)")
             try:
-                cct, _ = await http_head_ok(cu, referer=url)  # ← ใส่ referer เป็นหน้าต้นทาง
+                cct, _ = await http_head_ok(cu, referer=url)
                 if cct.startswith("video/"):
                     return {"mode": "direct", "url": cu, "variants": None}
                 if is_hls_content_type(cct) or cu.lower().endswith(".m3u8"):
-                    text2 = await fetch_text(cu, referer=url)  # ← ใส่ referer
+                    text2 = await fetch_text(cu, referer=url)
                     if hls_is_encrypted(text2):
                         continue
                     variants = parse_hls_master(text2, base_url=cu)
@@ -507,7 +507,22 @@ async def do_download_flow(ctx_like, link_msg: discord.Message, url: str):
         DOWNLOAD_DIR / (base_name if base_name.lower().endswith(".mp4") else base_name.rsplit(".",1)[0] + ".mp4")
     )
 
+    source_page = url  # ใช้เป็น referer
+    progress: Optional[discord.Message] = None
+
     try:
+        progress = await link_msg.reply("⏳ กำลังประมวลผล/ดาวน์โหลด...", mention_author=False)
+
+        # กันไฟล์ใหญ่มากถ้าไม่ได้ตั้ง S3 (เฉพาะโหลดแบบ direct)
+        if fmt == "mp4" and mode == "direct" and not s3_enabled():
+            try:
+                _, cl = await http_head_ok(selected_url, referer=source_page)
+                if cl and cl > MAX_FETCH_BYTES:
+                    await progress.edit(content=f"⚠️ ไฟล์ใหญ่ ~{cl/1024/1024:.1f} MB (> {MAX_FETCH_MB} MB) และยังไม่ได้ตั้งค่า S3 — ยกเลิก")
+                    return
+            except Exception:
+                pass
+
         if fmt == "mp4":
             if mode == "direct":
                 await stream_download(selected_url, out_path, referer=source_page)
@@ -525,30 +540,33 @@ async def do_download_flow(ctx_like, link_msg: discord.Message, url: str):
 
         size = out_path.stat().st_size
         if size <= MAX_DISCORD_BYTES:
-            await link_msg.reply(
-                f"✅ เสร็จแล้ว: `{out_path.name}` ({size/1024/1024:.2f} MB)",
-                file=discord.File(str(out_path)),
-                mention_author=False
-            )
+            await (progress.edit(content=f"✅ เสร็จแล้ว: `{out_path.name}` ({size/1024/1024:.2f} MB)") if progress else link_msg.reply(f"✅ เสร็จแล้ว: `{out_path.name}` ({size/1024/1024:.2f} MB)", mention_author=False))
+            await link_msg.reply(file=discord.File(str(out_path)), mention_author=False)
         else:
             if s3_enabled():
                 url_pub = s3_upload(out_path)
-                await link_msg.reply(
-                    f"✅ เสร็จแล้ว แต่ไฟล์ใหญ่ {size/1024/1024:.2f} MB (เกินลิมิตแนบไฟล์)\n📤 อัปขึ้น S3 ให้แล้ว: {url_pub}",
-                    mention_author=False
-                )
+                await (progress.edit(content=f"✅ เสร็จแล้ว แต่ไฟล์ใหญ่ {size/1024/1024:.2f} MB (เกินลิมิตแนบไฟล์)\n📤 อัปขึ้น S3 ให้แล้ว: {url_pub}") if progress else link_msg.reply(f"✅ เสร็จแล้ว แต่ไฟล์ใหญ่ {size/1024/1024:.2f} MB (เกินลิมิตแนบไฟล์)\n📤 อัปขึ้น S3 ให้แล้ว: {url_pub}", mention_author=False))
             else:
-                await link_msg.reply(
-                    f"✅ เสร็จแล้ว: `{out_path.name}` ({size/1024/1024:.2f} MB)\n"
-                    f"⚠️ เกินลิมิตแนบไฟล์ — ตั้งค่า S3 เพื่ออัปอัตโนมัติ",
-                    mention_author=False
-                )
+                await (progress.edit(content=f"✅ เสร็จแล้ว: `{out_path.name}` ({size/1024/1024:.2f} MB)\n⚠️ เกินลิมิตแนบไฟล์ — ตั้งค่า S3 เพื่ออัปอัตโนมัติ") if progress else link_msg.reply(f"✅ เสร็จแล้ว: `{out_path.name}` ({size/1024/1024:.2f} MB)\n⚠️ เกินลิมิตแนบไฟล์ — ตั้งค่า S3 เพื่ออัปอัตโนมัติ", mention_author=False))
     except NotAllowed as e:
-        await link_msg.reply(f"❌ {e}", mention_author=False)
+        if progress:
+            await progress.edit(content=f"❌ {e}")
+        else:
+            await link_msg.reply(f"❌ {e}", mention_author=False)
     except FetchError as e:
-        await link_msg.reply(f"❌ FetchError: {e}", mention_author=False)
+        if progress:
+            await progress.edit(content=f"❌ FetchError: {e}")
+        else:
+            await link_msg.reply(f"❌ FetchError: {e}", mention_author=False)
     except Exception as e:
-        await link_msg.reply(f"❌ Error: {type(e).__name__}: {e}", mention_author=False)
+        if progress:
+            await progress.edit(content=f"❌ Error: {type(e).__name__}: {e}")
+        else:
+            await link_msg.reply(f"❌ Error: {type(e).__name__}: {e}", mention_author=False)
+    finally:
+        # ล้างไฟล์ผลลัพธ์ ป้องกันดิสก์เต็ม
+        try: out_path.unlink(missing_ok=True)
+        except: pass
 
 # ---------- Commands (optional) ----------
 @bot.command(name="fetch", aliases=["grab"])
@@ -574,9 +592,6 @@ async def fetch_cmd(ctx: commands.Context, url: Optional[str] = None):
 class _DummyCtx:
     def __init__(self, user_id: int):
         self.author = type("U",(object,),{"id": user_id})()
-
-class AudioExtSelect(discord.ui.View):
-    ...  # (คงเหมือนด้านบน อยู่แล้ว)
 
 async def handle_mp4_attachment_message(message: discord.Message):
     if ALLOWED_CHANNEL_IDS and (message.channel.id not in ALLOWED_CHANNEL_IDS):
@@ -646,6 +661,8 @@ async def handle_mp4_attachment_message(message: discord.Message):
     finally:
         try: src_path.unlink(missing_ok=True)
         except: pass
+        try: out_path.unlink(missing_ok=True)
+        except: pass
 
 # ---------- Link flow: detect link in any message ----------
 async def handle_link_message(message: discord.Message):
@@ -667,9 +684,13 @@ async def handle_link_message(message: discord.Message):
 # ---------- Global message hook ----------
 @bot.event
 async def on_message(message: discord.Message):
+    # กันยิงซ้ำถ้าเป็นคำสั่ง
+    content = (message.content or "").lstrip()
+    is_cmd = any(content.startswith(pfx) for pfx in COMMAND_PREFIXES)
     try:
-        await handle_mp4_attachment_message(message)  # โยนไฟล์ .mp4 → ถามนามสกุลเสียง
-        await handle_link_message(message)            # แปะลิงก์ → เปิด flow อัตโนมัติ / บอกเหตุผลถ้าบล็อก
+        if not is_cmd:
+            await handle_mp4_attachment_message(message)  # โยนไฟล์ .mp4 → ถามนามสกุลเสียง
+            await handle_link_message(message)            # แปะลิงก์ → เปิด flow อัตโนมัติ / บอกเหตุผลถ้าบล็อก
     finally:
         await bot.process_commands(message)
 
