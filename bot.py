@@ -1,6 +1,6 @@
 # bot.py — yt-dlp only + Google Cloud Storage (GCS) uploader with GCP_SERVICE_ACCOUNT_B64
 import os, re, json, time, asyncio, pathlib, random, string, mimetypes, datetime, base64
-from typing import List, Optional, Tuple
+from typing import List, Optional
 from urllib.parse import urlparse
 
 import httpx, aiofiles
@@ -15,24 +15,31 @@ from google.oauth2 import service_account
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 MAX_DISCORD_BYTES = int(os.getenv("UPLOAD_LIMIT_BYTES", str(24 * 1024 * 1024)))  # Discord upload limit (default 24MB)
 
-# yt-dlp settings (เปิด/จำกัดโดเมนที่อนุญาต)
-YTDLP_ENABLED = os.getenv("ENABLE_YTDLP", "1") == "1"  # เปิดค่าเริ่มต้น เพื่อให้ใช้งานได้ทันที
+# yt-dlp settings
+YTDLP_ENABLED = os.getenv("ENABLE_YTDLP", "1") == "1"
 YTDLP_DOMAINS = set(d.strip().lower() for d in (os.getenv("YTDLP_DOMAINS") or "youtube.com,youtu.be,youtube-nocookie.com").split(",") if d.strip())
 YTDLP_MAX_BYTES = int(os.getenv("YTDLP_MAX_BYTES", str(350 * 1024 * 1024)))  # 350MB default
 YTDLP_COOKIES_FROM_BROWSER = os.getenv("YTDLP_COOKIES_FROM_BROWSER")  # e.g. "chrome"
 
+# Anti-403 helpers
+YTDLP_FORCE_IPV4 = os.getenv("YTDLP_FORCE_IPV4", "1") == "1"
+YTDLP_PROXY = os.getenv("YTDLP_PROXY") or None
+YTDLP_COOKIES_B64 = os.getenv("YTDLP_COOKIES_B64")
+YTDLP_YT_CLIENTS = [c.strip() for c in (os.getenv("YTDLP_YT_CLIENTS") or "android,web").split(",") if c.strip()]
+YTDLP_GEO = os.getenv("YTDLP_GEO", "TH")
+
 # GCS (แทน S3)
 GCS_BUCKET = os.getenv("GCS_BUCKET", "")
-GCS_PUBLIC_BASE = (os.getenv("GCS_PUBLIC_BASE", "") or "").rstrip("/")  # ถ้ามี CDN/URL เฉพาะ
+GCS_PUBLIC_BASE = (os.getenv("GCS_PUBLIC_BASE", "") or "").rstrip("/")
 GCS_LINK_MODE = (os.getenv("GCS_LINK_MODE") or "presign").lower()       # "presign" | "public"
-GCS_TTL_SECONDS = max(0, int(os.getenv("GCS_TTL_SECONDS", "3600")))     # อายุลิงก์/เวลาลบ (วินาที) 0 = ไม่ตั้งเวลาลบ
+GCS_TTL_SECONDS = max(0, int(os.getenv("GCS_TTL_SECONDS", "3600")))     # อายุลิงก์/เวลาลบ (วินาที) 0 = ไม่ลบ
 
-# วิธี auth GCP (เลือกอย่างใดอย่างหนึ่ง)
-GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")  # path file (ถ้ามี)
-GCS_CREDENTIALS_JSON = os.getenv("GCS_CREDENTIALS_JSON")                          # วาง JSON ทั้งก้อนใน env
-GCP_SERVICE_ACCOUNT_B64 = os.getenv("GCP_SERVICE_ACCOUNT_B64")                    # base64 ของ JSON
+# Auth GCP (เลือกอย่างใดอย่างหนึ่งก็พอ)
+GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+GCS_CREDENTIALS_JSON = os.getenv("GCS_CREDENTIALS_JSON")
+GCP_SERVICE_ACCOUNT_B64 = os.getenv("GCP_SERVICE_ACCOUNT_B64")
 
-# ใช้ allowlist ห้อง/เธรด (ไฟล์แยกก็ได้)
+# ใช้ allowlist ห้อง/เธรด (ถ้ามีไฟล์)
 try:
     from channel_allowlist import ALLOWED_CHANNEL_IDS  # set[int]
 except Exception:
@@ -41,7 +48,7 @@ except Exception:
 # ========== Discord ==========
 INTENTS = discord.Intents.default()
 INTENTS.message_content = True
-COMMAND_PREFIXES = tuple((os.getenv("COMMAND_PREFIXES") or "!").split(","))  # กันยิงซ้ำกับ on_message
+COMMAND_PREFIXES = tuple((os.getenv("COMMAND_PREFIXES") or "!").split(","))  # กันชนคำสั่งกับ on_message
 bot = commands.Bot(command_prefix=COMMAND_PREFIXES[0], intents=INTENTS)
 
 DOWNLOAD_DIR = pathlib.Path("downloads")
@@ -142,7 +149,6 @@ def _get_gcs_client() -> storage.Client:
         creds = service_account.Credentials.from_service_account_info(info)
         _GCS_CLIENT = storage.Client(credentials=creds, project=creds.project_id)
     else:
-        # ใช้ ADC: GOOGLE_APPLICATION_CREDENTIALS หรือ metadata server
         _GCS_CLIENT = storage.Client()
     return _GCS_CLIENT
 
@@ -244,6 +250,7 @@ async def download_with_ytdlp(url: str, audio_only: bool, progress_msg: Optional
     latest_file_path: Optional[pathlib.Path] = None
     last_edit = 0.0
     loop = asyncio.get_running_loop()
+    tmp_cookiefile: Optional[pathlib.Path] = None
 
     async def update_progress(d: dict):
         nonlocal latest_file_path, last_edit
@@ -281,11 +288,25 @@ async def download_with_ytdlp(url: str, audio_only: bool, progress_msg: Optional
         "progress_hooks": [hook],
         "max_filesize": YTDLP_MAX_BYTES,
         "merge_output_format": "mp4",
+        "retries": 10,
+        "fragment_retries": 50,
+        "skip_unavailable_fragments": True,
+        "sleep_interval_requests": 0.5,
+        "geo_bypass": True,
+        "geo_bypass_country": YTDLP_GEO,
         "http_headers": {
             "User-Agent": DEFAULT_HEADERS["user-agent"],
             "Accept-Language": DEFAULT_HEADERS["accept-language"],
+            "Referer": url,
         },
+        "extractor_args": {"youtube": {"player_client": YTDLP_YT_CLIENTS}},
     }
+
+    if YTDLP_FORCE_IPV4:
+        ydl_opts["source_address"] = "0.0.0.0"
+
+    if YTDLP_PROXY:
+        ydl_opts["proxy"] = YTDLP_PROXY
 
     if audio_only:
         ydl_opts.update({
@@ -304,6 +325,14 @@ async def download_with_ytdlp(url: str, audio_only: bool, progress_msg: Optional
     if YTDLP_COOKIES_FROM_BROWSER:
         ydl_opts["cookiesfrombrowser"] = (YTDLP_COOKIES_FROM_BROWSER, )
 
+    if YTDLP_COOKIES_B64:
+        try:
+            tmp_cookiefile = DOWNLOAD_DIR / "cookies.txt"
+            tmp_cookiefile.write_text(base64.b64decode(YTDLP_COOKIES_B64).decode("utf-8"), encoding="utf-8")
+            ydl_opts["cookiefile"] = str(tmp_cookiefile)
+        except Exception:
+            tmp_cookiefile = None
+
     def _run():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             return ydl.extract_info(url, download=True)
@@ -312,8 +341,15 @@ async def download_with_ytdlp(url: str, audio_only: bool, progress_msg: Optional
         info = await asyncio.to_thread(_run)
     except yt_dlp.utils.DownloadError as e:
         raise RuntimeError(f"yt-dlp failed: {e}") from e
+    finally:
+        # ลบคุกกี้ชั่วคราว
+        try:
+            if tmp_cookiefile:
+                tmp_cookiefile.unlink(missing_ok=True)
+        except Exception:
+            pass
 
-    # ระบุไฟล์ผลลัพธ์
+    # หาไฟล์ผลลัพธ์
     candidate = info.get("_filename")
     if candidate:
         p = pathlib.Path(candidate)
@@ -431,6 +467,8 @@ async def ytfetchdiag(ctx: commands.Context, url: str):
             f"- host=`{h}` blocked=`{is_blocked_host(h)}`\n"
             f"- YTDLP_ENABLED=`{YTDLP_ENABLED}` allowed=`{is_ytdlp_allowed_for(url)}`\n"
             f"- YTDLP_MAX_BYTES=`{YTDLP_MAX_BYTES}`\n"
+            f"- force_ipv4=`{YTDLP_FORCE_IPV4}` proxy=`{bool(YTDLP_PROXY)}` geo=`{YTDLP_GEO}`\n"
+            f"- cookies_b64=`{bool(YTDLP_COOKIES_B64)}` clients=`{','.join(YTDLP_YT_CLIENTS)}`\n"
             f"- GCS enabled=`{gcs_enabled()}` mode=`{GCS_LINK_MODE}` ttl=`{GCS_TTL_SECONDS}`",
             mention_author=False
         )
