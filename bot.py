@@ -1,9 +1,9 @@
-# bot.py — yt-dlp only + Google Cloud Storage (GCS) uploader with GCP_SERVICE_ACCOUNT_B64
+# bot.py — yt-dlp only + GCS + 403-hardened (PO token, client rotate, fragment tuning, HLS fallback)
 import os, re, json, time, asyncio, pathlib, random, string, mimetypes, datetime, base64
 from typing import List, Optional
 from urllib.parse import urlparse
 
-import httpx, aiofiles
+import aiofiles
 import discord
 from discord.ext import commands
 
@@ -13,28 +13,34 @@ from google.oauth2 import service_account
 
 # ========== ENV ==========
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
-MAX_DISCORD_BYTES = int(os.getenv("UPLOAD_LIMIT_BYTES", str(24 * 1024 * 1024)))  # Discord upload limit (default 24MB)
+MAX_DISCORD_BYTES = int(os.getenv("UPLOAD_LIMIT_BYTES", str(24 * 1024 * 1024)))  # Discord attach limit
 
-# yt-dlp settings
-YTDLP_ENABLED = os.getenv("ENABLE_YTDLP", "1") == "1"
+# yt-dlp basic
+YTDLP_ENABLED = True  # ใช้ yt-dlp เท่านั้น
 YTDLP_DOMAINS = set(d.strip().lower() for d in (os.getenv("YTDLP_DOMAINS") or "youtube.com,youtu.be,youtube-nocookie.com").split(",") if d.strip())
-YTDLP_MAX_BYTES = int(os.getenv("YTDLP_MAX_BYTES", str(350 * 1024 * 1024)))  # 350MB default
-YTDLP_COOKIES_FROM_BROWSER = os.getenv("YTDLP_COOKIES_FROM_BROWSER")  # e.g. "chrome"
-
-# Anti-403 helpers
+YTDLP_MAX_BYTES = int(os.getenv("YTDLP_MAX_BYTES", str(350 * 1024 * 1024)))  # 350 MB
 YTDLP_FORCE_IPV4 = os.getenv("YTDLP_FORCE_IPV4", "1") == "1"
 YTDLP_PROXY = os.getenv("YTDLP_PROXY") or None
-YTDLP_COOKIES_B64 = os.getenv("YTDLP_COOKIES_B64")
-YTDLP_YT_CLIENTS = [c.strip() for c in (os.getenv("YTDLP_YT_CLIENTS") or "android,web").split(",") if c.strip()]
+YTDLP_COOKIES_B64 = os.getenv("YTDLP_COOKIES_B64")  # เนื้อไฟล์ cookies.txt base64
+YTDLP_COOKIES_FROM_BROWSER = os.getenv("YTDLP_COOKIES_FROM_BROWSER")  # e.g. "chrome"
 YTDLP_GEO = os.getenv("YTDLP_GEO", "TH")
+YTDLP_DEBUG = os.getenv("YTDLP_DEBUG", "0") == "1"
 
-# GCS (แทน S3)
+# YouTube extractor hardening
+# ลำดับ clients จะถูกลองตามค่านี้ (กรณีเฟลจะสลับตัวถัดไปอัตโนมัติ)
+YTDLP_YT_CLIENTS = [c.strip() for c in (os.getenv("YTDLP_YT_CLIENTS") or "web,android").split(",") if c.strip()]
+# ถ้ามี PO token ให้ตั้ง เช่น ios.gvs+<TOKEN> หรือ web+<TOKEN>
+YTDLP_YT_PO_TOKEN = os.getenv("YTDLP_YT_PO_TOKEN")
+# ลด concurrent fragments เพื่อลด 403 ระหว่างดาวน์โหลด DASH/HLS
+YTDLP_CONCURRENT_FRAGMENTS = int(os.getenv("YTDLP_CONCURRENT_FRAGMENTS", "1"))  # 1 คือปลอดภัยสุด
+
+# GCS
 GCS_BUCKET = os.getenv("GCS_BUCKET", "")
 GCS_PUBLIC_BASE = (os.getenv("GCS_PUBLIC_BASE", "") or "").rstrip("/")
-GCS_LINK_MODE = (os.getenv("GCS_LINK_MODE") or "presign").lower()       # "presign" | "public"
-GCS_TTL_SECONDS = max(0, int(os.getenv("GCS_TTL_SECONDS", "3600")))     # อายุลิงก์/เวลาลบ (วินาที) 0 = ไม่ลบ
+GCS_LINK_MODE = (os.getenv("GCS_LINK_MODE") or "presign").lower()  # "presign" | "public"
+GCS_TTL_SECONDS = max(0, int(os.getenv("GCS_TTL_SECONDS", "3600")))  # อายุลิงก์หรือนำไปลบ (วินาที)
 
-# Auth GCP (เลือกอย่างใดอย่างหนึ่งก็พอ)
+# GCP credential (เลือกอย่างใดอย่างหนึ่งพอ)
 GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
 GCS_CREDENTIALS_JSON = os.getenv("GCS_CREDENTIALS_JSON")
 GCP_SERVICE_ACCOUNT_B64 = os.getenv("GCP_SERVICE_ACCOUNT_B64")
@@ -48,7 +54,7 @@ except Exception:
 # ========== Discord ==========
 INTENTS = discord.Intents.default()
 INTENTS.message_content = True
-COMMAND_PREFIXES = tuple((os.getenv("COMMAND_PREFIXES") or "!").split(","))  # กันชนคำสั่งกับ on_message
+COMMAND_PREFIXES = tuple((os.getenv("COMMAND_PREFIXES") or "!").split(","))
 bot = commands.Bot(command_prefix=COMMAND_PREFIXES[0], intents=INTENTS)
 
 DOWNLOAD_DIR = pathlib.Path("downloads")
@@ -63,7 +69,7 @@ DEFAULT_HEADERS = {
 BLOCKED_DOMAINS = {
     "netflix.com", "disneyplus.com", "primevideo.com", "hulu.com",
     "max.com", "paramountplus.com", "peacocktv.com", "tv.apple.com",
-    "crunchyroll.com",
+    "crunchyroll.com", "hotstar.com", "viu.com",
     "onlyfans.com", "fansly.com",
     "patreon.com",
 }
@@ -85,8 +91,7 @@ def is_ytdlp_allowed_for(url: str) -> bool:
 URL_RE = re.compile(r"https?://\S+")
 def extract_first_url(text: str) -> Optional[str]:
     m = URL_RE.search(text or "")
-    if not m:
-        return None
+    if not m: return None
     u = m.group(0)
     return u.rstrip(">)].,!?\"'")
 
@@ -138,8 +143,6 @@ def _get_gcs_client() -> storage.Client:
     global _GCS_CLIENT
     if _GCS_CLIENT is not None:
         return _GCS_CLIENT
-
-    # ลำดับความสำคัญ: GCS_CREDENTIALS_JSON > GCP_SERVICE_ACCOUNT_B64 > GOOGLE_APPLICATION_CREDENTIALS/ADC
     if GCS_CREDENTIALS_JSON:
         info = json.loads(GCS_CREDENTIALS_JSON)
         creds = service_account.Credentials.from_service_account_info(info)
@@ -158,17 +161,11 @@ async def _gcs_delete_after(object_name: str, delay_seconds: int):
         await asyncio.sleep(delay_seconds)
         client = _get_gcs_client()
         bucket = client.bucket(GCS_BUCKET)
-        blob = bucket.blob(object_name)
-        blob.delete()
+        bucket.blob(object_name).delete()
     except Exception:
         pass
 
 def gcs_upload(local_path: pathlib.Path) -> tuple[str, str]:
-    """
-    อัปโหลดไฟล์ไป GCS แล้วคืน (url, object_name)
-    - presign: สร้าง URL แบบลงนามหมดอายุ (V4)
-    - public: make_public() หรือใช้ GCS_PUBLIC_BASE
-    """
     client = _get_gcs_client()
     bucket = client.bucket(GCS_BUCKET)
 
@@ -177,19 +174,15 @@ def gcs_upload(local_path: pathlib.Path) -> tuple[str, str]:
 
     content_type = mimetypes.guess_type(local_path.name)[0] or "application/octet-stream"
     blob.cache_control = "no-store" if GCS_LINK_MODE == "presign" else "public, max-age=3600"
-
     blob.upload_from_filename(str(local_path), content_type=content_type)
 
     if GCS_LINK_MODE == "public":
-        try:
-            blob.make_public()
-        except Exception:
-            pass
+        try: blob.make_public()
+        except Exception: pass
         if GCS_PUBLIC_BASE:
             return f"{GCS_PUBLIC_BASE}/{object_name}", object_name
         return f"https://storage.googleapis.com/{GCS_BUCKET}/{object_name}", object_name
 
-    # presigned URL V4
     expires = datetime.timedelta(seconds=min(max(GCS_TTL_SECONDS or 3600, 60), 7*24*3600))
     url = blob.generate_signed_url(expiration=expires, version="v4", method="GET")
     return url, object_name
@@ -240,13 +233,8 @@ class AudioExtSelect(discord.ui.View):
         await interaction.response.defer()
         self.stop()
 
-# ---------- yt-dlp core ----------
+# ---------- yt-dlp core (403-hardened) ----------
 async def download_with_ytdlp(url: str, audio_only: bool, progress_msg: Optional[discord.Message]) -> pathlib.Path:
-    """
-    ดาวน์โหลดด้วย yt-dlp
-    - audio_only=True -> .mp3
-    - else -> .mp4 (merge video+audio)
-    """
     latest_file_path: Optional[pathlib.Path] = None
     last_edit = 0.0
     loop = asyncio.get_running_loop()
@@ -257,7 +245,7 @@ async def download_with_ytdlp(url: str, audio_only: bool, progress_msg: Optional
         if not progress_msg:
             return
         now = time.time()
-        if now - last_edit < 0.7:
+        if now - last_edit < 0.6:
             return
         last_edit = now
 
@@ -267,10 +255,10 @@ async def download_with_ytdlp(url: str, audio_only: bool, progress_msg: Optional
             s = (d.get("_speed_str") or "").strip()
             e = d.get("eta")
             eta = f" ETA {int(e)}s" if isinstance(e, (int,float)) and e > 0 else ""
-            try: await progress_msg.edit(content=f"⬇️ ดาวน์โหลดด้วย yt-dlp… {p} {s}{eta}")
+            try: await progress_msg.edit(content=f"⬇️ yt-dlp… {p} {s}{eta}")
             except Exception: pass
         elif status == "finished":
-            try: await progress_msg.edit(content="🔄 กำลังรวม/แปลงไฟล์ (ffmpeg)…")
+            try: await progress_msg.edit(content="🔄 รวม/แปลงไฟล์…")
             except Exception: pass
 
         fn = d.get("filename")
@@ -281,8 +269,12 @@ async def download_with_ytdlp(url: str, audio_only: bool, progress_msg: Optional
         loop.call_soon_threadsafe(asyncio.create_task, update_progress(d))
 
     outtmpl = str(DOWNLOAD_DIR / "%(title).200B [%(id)s].%(ext)s")
-    ydl_opts = {
-        "quiet": True, "no_warnings": True,
+
+    # สร้างออปชั่นพื้นฐาน (จะถูกคัดลอก/แก้ในแต่ละรอบลอง)
+    base_opts = {
+        "quiet": not YTDLP_DEBUG,
+        "no_warnings": not YTDLP_DEBUG,
+        "verbose": YTDLP_DEBUG,
         "outtmpl": outtmpl,
         "noprogress": True,
         "progress_hooks": [hook],
@@ -299,83 +291,102 @@ async def download_with_ytdlp(url: str, audio_only: bool, progress_msg: Optional
             "Accept-Language": DEFAULT_HEADERS["accept-language"],
             "Referer": url,
         },
-        "extractor_args": {"youtube": {"player_client": YTDLP_YT_CLIENTS}},
+        # ลดการยิงพร้อมกันของ fragment (ป้องกัน 403 จากบาง PoP)
+        "concurrent_fragment_downloads": max(1, YTDLP_CONCURRENT_FRAGMENTS),
     }
 
     if YTDLP_FORCE_IPV4:
-        ydl_opts["source_address"] = "0.0.0.0"
-
+        base_opts["source_address"] = "0.0.0.0"
     if YTDLP_PROXY:
-        ydl_opts["proxy"] = YTDLP_PROXY
-
-    if audio_only:
-        ydl_opts.update({
-            "format": "bestaudio/best",
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }],
-        })
-    else:
-        ydl_opts.update({
-            "format": "bv*+ba/b",
-        })
-
+        base_opts["proxy"] = YTDLP_PROXY
     if YTDLP_COOKIES_FROM_BROWSER:
-        ydl_opts["cookiesfrombrowser"] = (YTDLP_COOKIES_FROM_BROWSER, )
+        base_opts["cookiesfrombrowser"] = (YTDLP_COOKIES_FROM_BROWSER, )
 
     if YTDLP_COOKIES_B64:
         try:
             tmp_cookiefile = DOWNLOAD_DIR / "cookies.txt"
             tmp_cookiefile.write_text(base64.b64decode(YTDLP_COOKIES_B64).decode("utf-8"), encoding="utf-8")
-            ydl_opts["cookiefile"] = str(tmp_cookiefile)
+            base_opts["cookiefile"] = str(tmp_cookiefile)
         except Exception:
             tmp_cookiefile = None
 
-    def _run():
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            return ydl.extract_info(url, download=True)
+    # แผนการลอง (matrix): สลับ client และบังคับ HLS เป็นลำดับ fallback
+    # หมายเหตุ: ถ้ามี PO token ค่อยลอง ios.gvs (หรือ client อื่นที่ต้อง token)
+    client_sequences: List[List[str]] = []
+    if YTDLP_YT_CLIENTS:
+        client_sequences.append(YTDLP_YT_CLIENTS)
+    # เพิ่ม fallback เฉพาะเจาะจง
+    client_sequences += [["web"], ["android"]]
+    if YTDLP_YT_PO_TOKEN:
+        client_sequences += [["ios"]]  # ios.gvs ต้องมี po_token
 
-    try:
-        info = await asyncio.to_thread(_run)
-    except yt_dlp.utils.DownloadError as e:
-        raise RuntimeError(f"yt-dlp failed: {e}") from e
-    finally:
-        # ลบคุกกี้ชั่วคราว
-        try:
-            if tmp_cookiefile:
-                tmp_cookiefile.unlink(missing_ok=True)
-        except Exception:
-            pass
+    # formats ที่จะลองในแต่ละ client
+    fmt_default_video = "bv*+ba/b"
+    fmt_hls_first = "bestvideo*[protocol*=m3u8]+bestaudio/best[protocol*=m3u8]/best"
+    fmt_audio = "bestaudio/best"
 
-    # หาไฟล์ผลลัพธ์
-    candidate = info.get("_filename")
-    if candidate:
-        p = pathlib.Path(candidate)
-        if not audio_only and p.suffix.lower() != ".mp4":
-            vid = info.get("id", "")
-            found = sorted(DOWNLOAD_DIR.glob(f"*[{vid}]*.mp4"), key=lambda x: x.stat().st_mtime, reverse=True)
-            if found:
-                p = found[0]
-        if p.exists() and not str(p).endswith(".part"):
-            latest_file_path = p
+    format_sequences = [[fmt_audio] if audio_only else [fmt_default_video, fmt_hls_first]]
 
-    if not latest_file_path or not latest_file_path.exists():
-        vid = info.get("id", "")
-        cand = [q for q in DOWNLOAD_DIR.glob(f"*[{vid}]*") if q.is_file() and not str(q).endswith(".part")]
-        if cand:
-            latest_file_path = sorted(cand, key=lambda x: x.stat().st_mtime, reverse=True)[0]
+    last_error: Optional[Exception] = None
 
-    if not latest_file_path or not latest_file_path.exists():
-        raise RuntimeError("ไม่พบไฟล์ผลลัพธ์หลังดาวน์โหลด (postprocess)")
+    for clients in client_sequences:
+        for fmts in format_sequences:
+            ydl_opts = dict(base_opts)  # clone
+            # extractor-args: player_client + po_token (ถ้ามี)
+            ex_args = {"youtube": {}}
+            if clients:
+                ex_args["youtube"]["player_client"] = clients
+            if YTDLP_YT_PO_TOKEN:
+                ex_args["youtube"]["po_token"] = YTDLP_YT_PO_TOKEN
+            ydl_opts["extractor_args"] = ex_args
 
-    return latest_file_path
+            # format
+            ydl_opts["format"] = fmts[0]
 
+            # ถ้าเป็น audio-only ให้ postprocessor แปลงเป็น mp3
+            if audio_only:
+                ydl_opts["postprocessors"] = [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }]
+
+            # ฟังก์ชันรันจริง
+            def _run():
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    return ydl.extract_info(url, download=True)
+
+            try:
+                info = await asyncio.to_thread(_run)
+                # หาไฟล์เอาต์พุต
+                p: Optional[pathlib.Path] = None
+                cand = info.get("_filename")
+                if cand:
+                    p = pathlib.Path(cand)
+                if p and (not p.exists() or str(p).endswith(".part")):
+                    p = None
+                if not p:
+                    vid = info.get("id", "")
+                    files = [q for q in DOWNLOAD_DIR.glob(f"*[{vid}]*") if q.is_file() and not str(q).endswith(".part")]
+                    if files:
+                        p = sorted(files, key=lambda x: x.stat().st_mtime, reverse=True)[0]
+                if not p:
+                    raise RuntimeError("ไม่พบไฟล์ผลลัพธ์หลังดาวน์โหลด (postprocess)")
+                return p
+            except Exception as e:
+                last_error = e
+                # ถ้าล้มเหลวด้วย 403 ให้ลอง format ถัดไป (เช่น HLS) หรือสลับ client
+                continue
+
+    # ถ้ามาถึงตรงนี้แปลว่าทุกรอบล้มเหลว
+    if last_error:
+        raise RuntimeError(f"yt-dlp failed: {last_error}")
+    raise RuntimeError("yt-dlp failed: unknown error")
+
+# ---------- Core flow ----------
 async def _do_ytdlp_flow(ctx_like, link_msg: discord.Message, url: str):
-    # ตรวจโดเมนอนุญาต
     if not is_ytdlp_allowed_for(url):
-        await link_msg.reply("โดเมนนี้ไม่ได้อยู่ใน YTDLP_DOMAINS หรือยังไม่เปิด ENABLE_YTDLP", mention_author=False)
+        await link_msg.reply("โดเมนนี้ไม่ได้อยู่ใน YTDLP_DOMAINS", mention_author=False)
         return
     if is_blocked_host(hostof(url)):
         await link_msg.reply("🚫 โดเมนนี้ไม่รองรับ (เสี่ยง TOS/DRM)", mention_author=False)
@@ -402,8 +413,7 @@ async def _do_ytdlp_flow(ctx_like, link_msg: discord.Message, url: str):
 
         size = final_path.stat().st_size
         if size <= MAX_DISCORD_BYTES:
-            if progress:
-                await progress.edit(content=f"✅ เสร็จแล้ว: `{final_path.name}` ({size/1024/1024:.2f} MB)")
+            if progress: await progress.edit(content=f"✅ เสร็จแล้ว: `{final_path.name}` ({size/1024/1024:.2f} MB)")
             await link_msg.reply(file=discord.File(str(final_path)), mention_author=False)
         else:
             if gcs_enabled():
@@ -413,32 +423,28 @@ async def _do_ytdlp_flow(ctx_like, link_msg: discord.Message, url: str):
                     if GCS_LINK_MODE == "presign":
                         ttl_msg = f"\n⏳ ลิงก์จะหมดอายุใน ~{GCS_TTL_SECONDS//60} นาที"
                     else:
-                        ttl_msg = f"\n⏳ จะลบไฟล์นี้จาก GCS ภายใน ~{GCS_TTL_SECONDS//60} นาที"
+                        ttl_msg = f"\n⏳ จะลบไฟล์จาก GCS ภายใน ~{GCS_TTL_SECONDS//60} นาที"
                     asyncio.create_task(_gcs_delete_after(object_name, GCS_TTL_SECONDS + 30))
                 if progress:
-                    await progress.edit(content=f"✅ เสร็จแล้ว แต่ไฟล์ใหญ่ {size/1024/1024:.2f} MB (เกินลิมิตแนบไฟล์)\n📤 อัปขึ้น GCS ให้แล้ว: {url_pub}{ttl_msg}")
+                    await progress.edit(content=f"✅ เสร็จแล้ว แต่ไฟล์ใหญ่ {size/1024/1024:.2f} MB (เกินลิมิตแนบไฟล์)\n📤 อัปขึ้น GCS: {url_pub}{ttl_msg}")
                 else:
-                    await link_msg.reply(f"✅ เสร็จแล้ว แต่ไฟล์ใหญ่ {size/1024/1024:.2f} MB (เกินลิมิตแนบไฟล์)\n📤 อัปขึ้น GCS ให้แล้ว: {url_pub}{ttl_msg}", mention_author=False)
+                    await link_msg.reply(f"✅ เสร็จแล้ว แต่ไฟล์ใหญ่ {size/1024/1024:.2f} MB (เกินลิมิตแนบไฟล์)\n📤 อัปขึ้น GCS: {url_pub}{ttl_msg}", mention_author=False)
             else:
                 if progress:
                     await progress.edit(content=f"✅ เสร็จแล้ว: `{final_path.name}` ({size/1024/1024:.2f} MB)\n⚠️ เกินลิมิตแนบไฟล์ — ตั้งค่า GCS เพื่ออัปอัตโนมัติ")
                 else:
                     await link_msg.reply(f"✅ เสร็จแล้ว: `{final_path.name}` ({size/1024/1024:.2f} MB)\n⚠️ เกินลิมิตแนบไฟล์ — ตั้งค่า GCS เพื่ออัปอัตโนมัติ", mention_author=False)
     except Exception as e:
-        if progress:
-            await progress.edit(content=f"❌ Error: {type(e).__name__}: {e}")
-        else:
-            await link_msg.reply(f"❌ Error: {type(e).__name__}: {e}", mention_author=False)
+        if progress: await progress.edit(content=f"❌ Error: {type(e).__name__}: {e}")
+        else: await link_msg.reply(f"❌ Error: {type(e).__name__}: {e}", mention_author=False)
     finally:
         try:
             if final_path and final_path.exists():
-                final_path.unlink(missing_ok=True)  # ลบไฟล์ local ทิ้งทันที
+                final_path.unlink(missing_ok=True)  # ลบไฟล์ local ทันที
         except Exception:
             pass
 
-# ---------- Core (link flow) ----------
 async def do_download_flow(ctx_like, link_msg: discord.Message, url: str):
-    # yt-dlp only
     await _do_ytdlp_flow(ctx_like, link_msg, url)
 
 # ---------- Commands ----------
@@ -454,7 +460,6 @@ async def fetch_cmd(ctx: commands.Context, url: Optional[str] = None):
     if not u:
         await ctx.reply("โปรดใส่ลิงก์ หรือ reply ไปที่ข้อความที่มีลิงก์ก่อน", mention_author=False)
         return
-
     await do_download_flow(ctx, link_msg, u)
 
 @bot.command(name="ytfetchdiag")
@@ -465,17 +470,18 @@ async def ytfetchdiag(ctx: commands.Context, url: str):
         await ctx.reply(
             f"**Diag (yt-dlp)** `{url}`\n"
             f"- host=`{h}` blocked=`{is_blocked_host(h)}`\n"
-            f"- YTDLP_ENABLED=`{YTDLP_ENABLED}` allowed=`{is_ytdlp_allowed_for(url)}`\n"
-            f"- YTDLP_MAX_BYTES=`{YTDLP_MAX_BYTES}`\n"
+            f"- YTDLP_ALLOWED=`{is_ytdlp_allowed_for(url)}` max_bytes=`{YTDLP_MAX_BYTES}`\n"
             f"- force_ipv4=`{YTDLP_FORCE_IPV4}` proxy=`{bool(YTDLP_PROXY)}` geo=`{YTDLP_GEO}`\n"
-            f"- cookies_b64=`{bool(YTDLP_COOKIES_B64)}` clients=`{','.join(YTDLP_YT_CLIENTS)}`\n"
+            f"- cookies_b64=`{bool(YTDLP_COOKIES_B64)}` cookies_browser=`{bool(YTDLP_COOKIES_FROM_BROWSER)}`\n"
+            f"- clients=`{','.join(YTDLP_YT_CLIENTS)}` po_token=`{bool(YTDLP_YT_PO_TOKEN)}`\n"
+            f"- concurrent_fragments=`{YTDLP_CONCURRENT_FRAGMENTS}`\n"
             f"- GCS enabled=`{gcs_enabled()}` mode=`{GCS_LINK_MODE}` ttl=`{GCS_TTL_SECONDS}`",
             mention_author=False
         )
     except Exception as e:
         await ctx.reply(f"diag error: {type(e).__name__}: {e}", mention_author=False)
 
-# ---------- Attachment flow: drop .mp4 -> ask audio ext -> convert ----------
+# ---------- Attachment flow ----------
 class _DummyCtx:
     def __init__(self, user_id: int):
         self.author = type("U",(object,),{"id": user_id})()
@@ -556,7 +562,7 @@ async def handle_mp4_attachment_message(message: discord.Message):
         try: out_path.unlink(missing_ok=True)
         except: pass
 
-# ---------- Link flow: detect link in any message ----------
+# ---------- Link flow ----------
 async def handle_link_message(message: discord.Message):
     if ALLOWED_CHANNEL_IDS and (message.channel.id not in ALLOWED_CHANNEL_IDS):
         return
@@ -568,16 +574,15 @@ async def handle_link_message(message: discord.Message):
         return
     await do_download_flow(_DummyCtx(message.author.id), message, u)
 
-# ---------- Global message hook ----------
+# ---------- Global hook ----------
 @bot.event
 async def on_message(message: discord.Message):
-    # กันยิงซ้ำถ้าเป็นคำสั่ง
     content = (message.content or "").lstrip()
     is_cmd = any(content.startswith(pfx) for pfx in COMMAND_PREFIXES)
     try:
         if not is_cmd:
-            await handle_mp4_attachment_message(message)  # โยนไฟล์ .mp4 → ถามนามสกุลเสียง
-            await handle_link_message(message)            # แปะลิงก์ → yt-dlp flow อัตโนมัติ
+            await handle_mp4_attachment_message(message)
+            await handle_link_message(message)
     finally:
         await bot.process_commands(message)
 
