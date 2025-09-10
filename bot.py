@@ -21,9 +21,9 @@ S3_PUBLIC_BASE = (os.getenv("S3_PUBLIC_BASE", "") or "").rstrip("/")
 
 # ใช้ allowlist ห้อง/เธรด (ไฟล์แยก)
 try:
-    from channel_allowlist import ALLOWED_CHANNEL_IDS
+    from channel_allowlist import ALLOWED_CHANNEL_IDS  # set[int]
 except Exception:
-    ALLOWED_CHANNEL_IDS = set()
+    ALLOWED_CHANNEL_IDS: set[int] = set()
 
 # ========== Discord ==========
 INTENTS = discord.Intents.default()
@@ -178,7 +178,7 @@ def parse_hls_master(text: str, base_url: str) -> List[HlsVariant]:
             if m2:
                 try: bw = int(m2.group(1))
                 except: bw = None
-            # next non-comment line is the playlist URL
+            # next non-comment line is playlist URL
             j = i + 1
             while j < len(lines) and lines[j].startswith("#"):
                 j += 1
@@ -351,14 +351,14 @@ class AudioExtSelect(discord.ui.View):
         self.stop()
 
 # ---------- Core (link flow) ----------
-async def do_download_flow(ctx: commands.Context, link_msg: discord.Message, url: str):
+async def do_download_flow(ctx_like, link_msg: discord.Message, url: str):
     # 1) Resolve
     info = await resolve_public_video(url)
     mode = info["mode"]
     variants: Optional[List[HlsVariant]] = info.get("variants")
 
     # 2) ถามฟอร์แมต (reply ไปที่ "ข้อความลิงก์" แบบสาธารณะ)
-    fmt_view = FormatChoice(ctx.author.id)
+    fmt_view = FormatChoice(ctx_like.author.id)
     ask_msg = await link_msg.reply(
         "ต้องการโหลดเป็น **MP4** หรือ **MP3** ?",
         mention_author=False,
@@ -374,7 +374,7 @@ async def do_download_flow(ctx: commands.Context, link_msg: discord.Message, url
     # 3) ถ้า m3u8 + MP4 + มีหลายแทร็ก → ให้เลือกความละเอียดก่อน
     selected_url = info["url"]
     if fmt == "mp4" and mode == "m3u8" and variants:
-        vview = VariantSelect(ctx.author.id, variants)
+        vview = VariantSelect(ctx_like.author.id, variants)
         await ask_msg.edit(content="เลือกความละเอียด/บิตเรต (HLS):", view=vview)
         await vview.wait()
         if not vview.selected_variant:
@@ -404,10 +404,11 @@ async def do_download_flow(ctx: commands.Context, link_msg: discord.Message, url
             else:
                 await download_hls_to_mp4(selected_url, out_path)
         else:
+            # สำหรับโฟลว์ลิงก์ เลือกเป็น MP3 เป็นดีฟอลต์
             if mode == "direct":
                 tmp = DOWNLOAD_DIR / (base_name if base_name.lower().endswith(tuple(VIDEO_EXTS)) else base_name + ".mp4")
                 await stream_download(selected_url, tmp)
-                await extract_audio_generic(str(tmp), out_path, "mp3")  # default mp3 กรณีเลือกจากลิงก์
+                await extract_audio_generic(str(tmp), out_path, "mp3")
                 try: tmp.unlink(missing_ok=True)
                 except: pass
             else:
@@ -440,7 +441,7 @@ async def do_download_flow(ctx: commands.Context, link_msg: discord.Message, url
     except Exception as e:
         await link_msg.reply(f"❌ Error: {type(e).__name__}: {e}", mention_author=False)
 
-# ---------- Commands (link -> choose -> download) ----------
+# ---------- Commands (optional) ----------
 @bot.command(name="fetch", aliases=["grab"])
 @require_allowed_channel()
 async def fetch_cmd(ctx: commands.Context, url: Optional[str] = None):
@@ -448,7 +449,7 @@ async def fetch_cmd(ctx: commands.Context, url: Optional[str] = None):
     ใช้ได้ 2 แบบ:
       1) !fetch <url>
       2) Reply ไปที่ข้อความที่มีลิงก์ แล้วพิมพ์ !fetch
-    บอทจะตอบกลับ “ข้อความลิงก์” ด้วยปุ่มเลือก MP4/MP3 และ (ถ้ามี) ตัวเลือกความละเอียด
+    (แต่อัตโนมัติจาก on_message ก็มีอยู่แล้ว)
     """
     link_msg: discord.Message = ctx.message
     if ctx.message.reference and ctx.message.reference.resolved:
@@ -469,6 +470,10 @@ async def fetch_cmd(ctx: commands.Context, url: Optional[str] = None):
     await do_download_flow(ctx, link_msg, link_url)
 
 # ---------- Attachment flow: drop .mp4 -> ask audio ext -> convert ----------
+class _DummyCtx:
+    def __init__(self, user_id: int):
+        self.author = type("U",(object,),{"id": user_id})()
+
 async def handle_mp4_attachment_message(message: discord.Message):
     # allowlist
     if ALLOWED_CHANNEL_IDS and (message.channel.id not in ALLOWED_CHANNEL_IDS):
@@ -543,11 +548,36 @@ async def handle_mp4_attachment_message(message: discord.Message):
         try: src_path.unlink(missing_ok=True)
         except: pass
 
+# ---------- Link flow: detect link in any message ----------
+def extract_first_url(text: str) -> Optional[str]:
+    m = URL_RE.search(text or "")
+    return m.group(0) if m else None
+
+async def handle_link_message(message: discord.Message):
+    # allowlist
+    if ALLOWED_CHANNEL_IDS and (message.channel.id not in ALLOWED_CHANNEL_IDS):
+        return
+    if message.author.bot:
+        return
+
+    url = extract_first_url(message.content or "")
+    if not url:
+        return
+
+    host = hostof(url)
+    if any(b in host for b in BLOCKED_HOSTS):
+        await message.reply("🚫 โดเมนนี้ไม่รองรับ (เสี่ยง TOS/DRM)", mention_author=False)
+        return
+
+    # run flow (ใช้ dummy ctx ที่มี author.id)
+    await do_download_flow(_DummyCtx(message.author.id), message, url)
+
 # ---------- Global message hook ----------
 @bot.event
 async def on_message(message: discord.Message):
     try:
-        await handle_mp4_attachment_message(message)
+        await handle_mp4_attachment_message(message)  # โยนไฟล์ .mp4 → ถามนามสกุลเสียง
+        await handle_link_message(message)            # แปะลิงก์ → เปิด flow อัตโนมัติ / บอกเหตุผลถ้าบล็อก
     finally:
         await bot.process_commands(message)
 
