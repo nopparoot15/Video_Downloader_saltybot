@@ -1,0 +1,4 @@
+ALLOWED_CHANNEL_IDS: set[int] = {
+    1415404527976190135,
+
+}
