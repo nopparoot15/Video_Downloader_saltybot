@@ -1,4 +1,4 @@
-# bot.py
+# bot.py (patched)
 import os, re, pathlib, asyncio, time, random, string
 from typing import List, Optional, Tuple
 from dataclasses import dataclass
@@ -36,10 +36,17 @@ DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 VIDEO_EXTS = {".mp4", ".mov", ".webm", ".mkv", ".m4v", ".ts"}
 HLS_EXTS = {".m3u8"}
 
-# โดเมนที่เสี่ยง TOS/DRM — ไม่แตะ
-BLOCKED_HOSTS = {
+# ---------- Blocked domains (TOS/DRM risk) ----------
+BLOCKED_DOMAINS = {
 
 }
+
+def hostof(url: str) -> str:
+    return urlparse(url).netloc.split(":")[0].lower()
+
+def is_blocked_host(host: str) -> bool:
+    host = (host or "").lower()
+    return any(host == d or host.endswith("." + d) for d in BLOCKED_DOMAINS)
 
 URL_RE = re.compile(r"https?://\S+")
 
@@ -91,9 +98,6 @@ def require_allowed_channel():
     return commands.check(predicate)
 
 # ---------- Helpers ----------
-def hostof(url: str) -> str:
-    return urlparse(url).netloc.lower()
-
 def sanitize_filename(name: str) -> str:
     name = re.sub(r"[^\w\-. ]+", "_", name)
     return (name[:200] or "media").strip()
@@ -112,12 +116,6 @@ def s3_upload(local_path: pathlib.Path) -> str:
     s3.upload_file(str(local_path), S3_BUCKET, key, ExtraArgs={"ACL": "public-read"})
     return f"{S3_PUBLIC_BASE}/{key}"
 
-def is_hls_content_type(ct: str) -> bool:
-    ct = (ct or "").lower()
-    return ("application/x-mpegurl" in ct or
-            "application/vnd.apple.mpegurl" in ct or
-            ct == "audio/mpegurl")
-
 async def http_head_ok(url: str) -> Tuple[str, int]:
     async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
         r = await client.head(url)
@@ -128,6 +126,10 @@ async def http_head_ok(url: str) -> Tuple[str, int]:
         ct = r.headers.get("content-type","").lower()
         cl = int(r.headers.get("content-length") or 0)
         return ct, cl
+
+def is_hls_content_type(ct: str) -> bool:
+    ct = (ct or "").lower()
+    return ("application/x-mpegurl" in ct) or ("application/vnd.apple.mpegurl" in ct) or (ct == "audio/mpegurl")
 
 async def is_direct_video(url: str) -> bool:
     try:
@@ -239,10 +241,19 @@ def find_video_candidates(html: str, base_url: str) -> List[str]:
             seen.add(u); out.append(u)
     return out
 
+# ---------- URL utils ----------
+def extract_first_url(text: str) -> Optional[str]:
+    m = URL_RE.search(text or "")
+    if not m:
+        return None
+    url = m.group(0)
+    # ตัดตัวปิดบางอย่างที่ดีสคอร์ดอาจผนวกมา
+    return url.rstrip(">)].,!?\"'")
+
 # ---------- Resolver ----------
 async def resolve_public_video(url: str):
     host = hostof(url)
-    if any(b in host for b in BLOCKED_HOSTS):
+    if is_blocked_host(host):
         raise NotAllowed("โดเมนนี้ไม่รองรับ (เสี่ยง TOS/DRM)")
 
     # 0) HEAD เช็คชนิดไฟล์ก่อน
@@ -251,15 +262,12 @@ async def resolve_public_video(url: str):
         if ct.startswith("video/"):
             return {"mode": "direct", "url": url, "variants": None}
         if is_hls_content_type(ct):
-            # อาจเป็น media playlist (.m3u8) แม้ URL ไม่ลงท้าย .m3u8
             text = await fetch_text(url)
             if hls_is_encrypted(text):
                 raise NotAllowed("พบการเข้ารหัสใน .m3u8 — ไม่รองรับ")
             variants = parse_hls_master(text, base_url=url)
-            # ถ้าเป็น media playlist จะไม่มี STREAM-INF → ไม่มี variants ก็ยังโหลดได้
             return {"mode": "m3u8", "url": url, "variants": variants or None}
     except Exception:
-        # ถ้า HEAD ล้มเหลวก็ไปลำดับถัดไป
         pass
 
     # 1) นามสกุลไฟล์ตรง?
@@ -275,12 +283,15 @@ async def resolve_public_video(url: str):
         variants = parse_hls_master(text, base_url=url)
         return {"mode": "m3u8", "url": url, "variants": variants or None}
 
-    # 3) HTML → หา og:video/<video>/<source>/twitter:player:stream
+    # 3) HTML → หาคลู่วิดีโอ
     try:
         html = await fetch_text(url)
         cands = find_video_candidates(html, base_url=url)
         for cu in cands:
-            # ลอง HEAD ของ candidate ด้วยเผื่อเป็น HLS
+            h2 = hostof(cu)
+            if is_blocked_host(h2):
+                # ผู้ให้บริการฝังวิดีโอจากโดเมนต้องห้าม → ปฏิเสธ
+                raise NotAllowed("โดเมนนี้ไม่รองรับ (เสี่ยง TOS/DRM)")
             try:
                 cct, _ = await http_head_ok(cu)
                 if cct.startswith("video/"):
@@ -324,11 +335,11 @@ class FormatChoice(discord.ui.View):
         self.stop()
 
 class VariantSelect(discord.ui.View):
-    def __init__(self, requester_id: int, variants: List[HlsVariant], timeout: int = 120):
+    def __init__(self, requester_id: int, variants: List['HlsVariant'], timeout: int = 120):
         super().__init__(timeout=timeout)
         self.requester_id = requester_id
         self.variants = variants
-        self.selected_variant: Optional[HlsVariant] = None
+        self.selected_variant: Optional['HlsVariant'] = None
 
         opts = []
         for i, v in enumerate(variants):
@@ -373,7 +384,7 @@ class AudioExtSelect(discord.ui.View):
 
 # ---------- Core (link flow) ----------
 async def do_download_flow(ctx_like, link_msg: discord.Message, url: str):
-    # 1) Resolve (จับ NotAllowed ให้ตอบกลับแทนการ error เงียบ)
+    # Resolve + ตอบ error ให้ผู้ใช้เห็น
     try:
         info = await resolve_public_video(url)
     except NotAllowed as e:
@@ -386,7 +397,7 @@ async def do_download_flow(ctx_like, link_msg: discord.Message, url: str):
     mode = info["mode"]
     variants: Optional[List[HlsVariant]] = info.get("variants")
 
-    # 2) ถามฟอร์แมต (reply ไปที่ "ข้อความลิงก์" แบบสาธารณะ)
+    # ถามฟอร์แมต
     fmt_view = FormatChoice(ctx_like.author.id)
     ask_msg = await link_msg.reply(
         "ต้องการโหลดเป็น **MP4** หรือ **MP3** ?",
@@ -400,7 +411,7 @@ async def do_download_flow(ctx_like, link_msg: discord.Message, url: str):
         return
     fmt = fmt_view.choice
 
-    # 3) ถ้า m3u8 + MP4 + มีหลายแทร็ก → ให้เลือกความละเอียดก่อน
+    # เลือกความละเอียด (เฉพาะ HLS หลายแทร็ก)
     selected_url = info["url"]
     if fmt == "mp4" and mode == "m3u8" and variants:
         vview = VariantSelect(ctx_like.author.id, variants)
@@ -412,13 +423,13 @@ async def do_download_flow(ctx_like, link_msg: discord.Message, url: str):
             return
         selected_url = vview.selected_variant.url
 
-    # 4) ลบ “ข้อความตัวเลือก”
+    # ลบกล่องตัวเลือก
     try:
         await ask_msg.delete()
     except Exception:
         pass
 
-    # 5) ประมวลผลและส่งไฟล์กลับ “ตอบข้อความลิงก์”
+    # ประมวลผลและส่งไฟล์
     base_name = sanitize_filename(os.path.basename(urlparse(selected_url).path)) or "video"
     out_path = (
         DOWNLOAD_DIR / (base_name.rsplit(".",1)[0] + ".mp3")
@@ -433,9 +444,9 @@ async def do_download_flow(ctx_like, link_msg: discord.Message, url: str):
             else:
                 await download_hls_to_mp4(selected_url, out_path)
         else:
-            # สำหรับโฟลว์ลิงก์ เลือกเป็น MP3 เป็นดีฟอลต์
+            # โหมดลิงก์: default แปลงเป็น MP3
             if mode == "direct":
-                tmp = DOWNLOAD_DIR / (base_name if base_name.lower().endswith(tuple(VIDEO_EXTS)) else base_name + ".mp4")
+                tmp = DOWNLOAD_DIR / (base_name if pathlib.Path(base_name).suffix.lower() in VIDEO_EXTS else base_name + ".mp4")
                 await stream_download(selected_url, tmp)
                 await extract_audio_generic(str(tmp), out_path, "mp3")
                 try: tmp.unlink(missing_ok=True)
@@ -474,43 +485,36 @@ async def do_download_flow(ctx_like, link_msg: discord.Message, url: str):
 @bot.command(name="fetch", aliases=["grab"])
 @require_allowed_channel()
 async def fetch_cmd(ctx: commands.Context, url: Optional[str] = None):
-    """
-    ใช้ได้ 2 แบบ:
-      1) !fetch <url>
-      2) Reply ไปที่ข้อความที่มีลิงก์ แล้วพิมพ์ !fetch
-    (แต่อัตโนมัติจาก on_message ก็มีอยู่แล้ว)
-    """
     link_msg: discord.Message = ctx.message
     if ctx.message.reference and ctx.message.reference.resolved:
         link_msg = ctx.message.reference.resolved  # type: ignore
 
     target_text = (url or "").strip() or link_msg.content
-    m = URL_RE.search(target_text or "")
-    if not m:
+    u = extract_first_url(target_text or "")
+    if not u:
         await ctx.reply("โปรดใส่ลิงก์ หรือ reply ไปที่ข้อความที่มีลิงก์ก่อน", mention_author=False)
         return
 
-    link_url = m.group(0)
-    host = hostof(link_url)
-    if any(b in host for b in BLOCKED_HOSTS):
+    if is_blocked_host(hostof(u)):
         await link_msg.reply("🚫 โดเมนนี้ไม่รองรับ (เสี่ยง TOS/DRM)", mention_author=False)
         return
 
-    await do_download_flow(ctx, link_msg, link_url)
+    await do_download_flow(ctx, link_msg, u)
 
 # ---------- Attachment flow: drop .mp4 -> ask audio ext -> convert ----------
 class _DummyCtx:
     def __init__(self, user_id: int):
         self.author = type("U",(object,),{"id": user_id})()
 
+class AudioExtSelect(discord.ui.View):
+    ...  # (คงเหมือนด้านบน อยู่แล้ว)
+
 async def handle_mp4_attachment_message(message: discord.Message):
-    # allowlist
     if ALLOWED_CHANNEL_IDS and (message.channel.id not in ALLOWED_CHANNEL_IDS):
         return
     if message.author.bot:
         return
 
-    # หาไฟล์แนบ .mp4 ตัวแรก
     target_att: Optional[discord.Attachment] = None
     for att in message.attachments:
         filename = (att.filename or "").lower()
@@ -521,7 +525,6 @@ async def handle_mp4_attachment_message(message: discord.Message):
     if not target_att:
         return
 
-    # ถามนามสกุลเสียง
     view = AudioExtSelect(requester_id=message.author.id)
     ask_msg = await message.reply(
         f"แปลงไฟล์ **{target_att.filename}** เป็นไฟล์เสียงล้วน รูปแบบไหนดี?",
@@ -535,11 +538,9 @@ async def handle_mp4_attachment_message(message: discord.Message):
         return
     chosen = view.chosen_ext
 
-    # ลบกล่องตัวเลือก
     try: await ask_msg.delete()
     except: pass
 
-    # ดาวน์โหลด & แปลง
     base = sanitize_filename(os.path.splitext(target_att.filename)[0]) or "video"
     src_path = DOWNLOAD_DIR / f"{base}.mp4"
     out_path = DOWNLOAD_DIR / f"{base}.{chosen}"
@@ -578,28 +579,21 @@ async def handle_mp4_attachment_message(message: discord.Message):
         except: pass
 
 # ---------- Link flow: detect link in any message ----------
-def extract_first_url(text: str) -> Optional[str]:
-    m = URL_RE.search(text or "")
-    return m.group(0) if m else None
-
 async def handle_link_message(message: discord.Message):
-    # allowlist
     if ALLOWED_CHANNEL_IDS and (message.channel.id not in ALLOWED_CHANNEL_IDS):
         return
     if message.author.bot:
         return
 
-    url = extract_first_url(message.content or "")
-    if not url:
+    u = extract_first_url(message.content or "")
+    if not u:
         return
 
-    host = hostof(url)
-    if any(b in host for b in BLOCKED_HOSTS):
+    if is_blocked_host(hostof(u)):
         await message.reply("🚫 โดเมนนี้ไม่รองรับ (เสี่ยง TOS/DRM)", mention_author=False)
         return
 
-    # run flow (ใช้ dummy ctx ที่มี author.id)
-    await do_download_flow(_DummyCtx(message.author.id), message, url)
+    await do_download_flow(_DummyCtx(message.author.id), message, u)
 
 # ---------- Global message hook ----------
 @bot.event
