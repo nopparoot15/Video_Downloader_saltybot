@@ -463,7 +463,7 @@ class FormatChoice(discord.ui.View):
     def __init__(self, requester_id: int, timeout: int = 120):
         super().__init__(timeout=timeout)
         self.requester_id = requester_id
-        self.choice: Optional[str] = None  # "mp4" | "mp3"
+        self.choice: Optional[str] = None 
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.requester_id:
@@ -472,13 +472,13 @@ class FormatChoice(discord.ui.View):
         return True
 
     @discord.ui.button(label="MP4 (วิดีโอ)", style=discord.ButtonStyle.primary)
-    async def mp4(self, button: discord.ui.Button, interaction: discord.Interaction):
+    async def mp4(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.choice = "mp4"
         await interaction.response.defer()
         self.stop()
 
     @discord.ui.button(label="MP3 (เสียงล้วน)", style=discord.ButtonStyle.secondary)
-    async def mp3(self, button: discord.ui.Button, interaction: discord.Interaction):
+    async def mp3(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.choice = "mp3"
         await interaction.response.defer()
         self.stop()
