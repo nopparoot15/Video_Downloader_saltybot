@@ -38,9 +38,7 @@ HLS_EXTS = {".m3u8"}
 
 # โดเมนที่เสี่ยง TOS/DRM — ไม่แตะ
 BLOCKED_HOSTS = {
-    "youtube.com","www.youtube.com","m.youtube.com","music.youtube.com","youtu.be",
-    "tiktok.com","www.tiktok.com","vt.tiktok.com",
-    "instagram.com","www.instagram.com",
+
 }
 
 URL_RE = re.compile(r"https?://\S+")
