@@ -35,6 +35,13 @@ DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 VIDEO_EXTS = {".mp4", ".mov", ".webm", ".mkv", ".m4v", ".ts"}
 HLS_EXTS = {".m3u8"}
+source_page = url
+
+DEFAULT_HEADERS = {
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "accept-language": "en-US,en;q=0.8,th;q=0.7",
+}
 
 # ---------- Blocked domains (TOS/DRM risk) ----------
 BLOCKED_DOMAINS = {
@@ -74,9 +81,15 @@ def audio_ffmpeg_args(ext: str) -> List[str]:
         return ["-c:a","flac"]
     raise ValueError(f"unsupported audio ext: {ext}")
 
-async def extract_audio_generic(input_path_or_url: str, out_path: pathlib.Path, ext: str):
+async def extract_audio_generic(input_path_or_url: str, out_path: pathlib.Path, ext: str, referer: Optional[str] = None):
     args = audio_ffmpeg_args(ext)
-    cmd = ["ffmpeg","-y","-i", input_path_or_url, "-vn", *args, str(out_path)]
+    cmd = ["ffmpeg","-y"]
+    # ถ้าเป็น URL ให้ใส่ UA/Referer ให้ ffmpeg ด้วย
+    if "://" in input_path_or_url:
+        cmd += ["-user_agent", DEFAULT_HEADERS["user-agent"]]
+        if referer:
+            cmd += ["-referer", referer]
+    cmd += ["-i", input_path_or_url, "-vn", *args, str(out_path)]
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
@@ -116,8 +129,11 @@ def s3_upload(local_path: pathlib.Path) -> str:
     s3.upload_file(str(local_path), S3_BUCKET, key, ExtraArgs={"ACL": "public-read"})
     return f"{S3_PUBLIC_BASE}/{key}"
 
-async def http_head_ok(url: str) -> Tuple[str, int]:
-    async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
+async def http_head_ok(url: str, referer: Optional[str] = None) -> Tuple[str, int]:
+    headers = DEFAULT_HEADERS.copy()
+    if referer:
+        headers["referer"] = referer
+    async with httpx.AsyncClient(follow_redirects=True, timeout=30, headers=headers) as client:
         r = await client.head(url)
         if r.status_code in (405, 403):
             r = await client.get(url, stream=True)
@@ -141,14 +157,20 @@ async def is_direct_video(url: str) -> bool:
     except Exception:
         return False
 
-async def fetch_text(url: str) -> str:
-    async with httpx.AsyncClient(follow_redirects=True, timeout=40) as client:
+async def fetch_text(url: str, referer: Optional[str] = None) -> str:
+    headers = DEFAULT_HEADERS.copy()
+    if referer:
+        headers["referer"] = referer
+    async with httpx.AsyncClient(follow_redirects=True, timeout=40, headers=headers) as client:
         r = await client.get(url)
         r.raise_for_status()
         return r.text
 
-async def stream_download(url: str, dest: pathlib.Path, chunk=1<<16):
-    async with httpx.AsyncClient(follow_redirects=True, timeout=None) as client:
+async def stream_download(url: str, dest: pathlib.Path, chunk=1<<16, referer: Optional[str] = None):
+    headers = DEFAULT_HEADERS.copy()
+    if referer:
+        headers["referer"] = referer
+    async with httpx.AsyncClient(follow_redirects=True, timeout=None, headers=headers) as client:
         async with client.get(url) as r:
             r.raise_for_status()
             async with aiofiles.open(dest, "wb") as f:
@@ -196,22 +218,57 @@ def parse_hls_master(text: str, base_url: str) -> List[HlsVariant]:
     return variants
 
 async def download_hls_to_mp4(m3u8_url: str, out_path: pathlib.Path):
-    text = await fetch_text(m3u8_url)
+    text = await fetch_text(m3u8_url)  # ตรวจ KEY ก่อน
     if hls_is_encrypted(text):
         raise NotAllowed("พบการเข้ารหัสใน .m3u8 (DRM/KEY) — ไม่รองรับ")
-    cmd = [
+
+    base_cmd = [
         "ffmpeg","-y",
+        "-user_agent", DEFAULT_HEADERS["user-agent"],
+        "-referer", m3u8_url,
         "-protocol_whitelist","file,http,https,tcp,tls,crypto",
         "-i", m3u8_url,
         "-c","copy",
-        str(out_path)
+        "-movflags","+faststart",
     ]
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-    )
-    _, err = await proc.communicate()
-    if proc.returncode != 0:
-        raise FetchError(f"ffmpeg failed: {err.decode(errors='ignore')[:300]}")
+    # รอบแรก: กรณีสตรีม AAC ใน HLS
+    cmd1 = [*base_cmd, "-bsf:a","aac_adtstoasc", str(out_path)]
+    p1 = await asyncio.create_subprocess_exec(*cmd1, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    _, e1 = await p1.communicate()
+    if p1.returncode == 0:
+        return
+
+    # Fallback: ถ้าไม่ได้เป็น AAC
+    cmd2 = [*base_cmd, str(out_path)]
+    p2 = await asyncio.create_subprocess_exec(*cmd2, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    _, e2 = await p2.communicate()
+    if p2.returncode != 0:
+        msg = (e2 or e1).decode(errors="ignore")[:300]
+        raise FetchError(f"ffmpeg failed: {msg}")
+
+# ดึงลิงก์จาก JSON/สคริปต์ยอดฮิต
+JSON_URL_RE = re.compile(
+    r'(?:"|\'|)(?:file|src|url)(?:"|\'|)\s*:\s*["\'](https?://[^\s"\']+\.(?:m3u8|mp4|webm|mov)(?:\?[^\s"\']*)?)["\']',
+    re.I
+)
+JSON_SOURCES_RE = re.compile(
+    r'sources?\s*:\s*\[\s*{[^{}]*?src\s*:\s*["\'](https?://[^\s"\']+\.(?:m3u8|mp4|webm|mov)(?:\?[^\s"\']*)?)["\']',
+    re.I | re.S
+)
+# ยิงกว้างทั่วทั้งเอกสาร (fallback)
+FALLBACK_MEDIA_URL_RE = re.compile(
+    r'https?://[^\s"\'<>]+?\.(?:m3u8|mp4|webm|mov)(?:\?[^\s"\'<>]*)?',
+    re.I
+)
+
+def _normalize_url(u: str, base_url: str) -> str:
+    u = (u or "").strip()
+    if u.startswith("//"):
+        # เติม scheme ให้ URL แบบ schemeless
+        u = ("https:" if base_url.lower().startswith("https") else "http:") + u
+    if not urlparse(u).scheme:
+        u = urljoin(base_url, u)
+    return u
 
 # ---------- HTML candidates ----------
 VIDEO_CANDIDATE_PATTERNS = [
@@ -225,16 +282,30 @@ VIDEO_CANDIDATE_PATTERNS = [
 ]
 def find_video_candidates(html: str, base_url: str) -> List[str]:
     html = html or ""
-    urls = []
+    urls: List[str] = []
+
+    # 2.1 วิธีเดิม: meta/video/source/link (ดีแล้ว เก็บไว้)
     for pat in VIDEO_CANDIDATE_PATTERNS:
         for m in re.finditer(pat, html, flags=re.I):
             u = (m.group(1) or "").strip()
             if not u:
                 continue
-            if not urlparse(u).scheme:
-                u = urljoin(base_url, u)
-            urls.append(u)
-    # unique preserve order
+            urls.append(_normalize_url(u, base_url))
+
+    # 2.2 เพิ่ม: JSON/สคริปต์ยอดฮิต (sources/file/src/url)
+    for rx in (JSON_URL_RE, JSON_SOURCES_RE):
+        for m in rx.finditer(html):
+            u = (m.group(1) or "").strip()
+            if u:
+                urls.append(_normalize_url(u, base_url))
+
+    # 2.3 Fallback: ยิงกว้างหา .m3u8/.mp4 ทั้งเอกสาร
+    for m in FALLBACK_MEDIA_URL_RE.finditer(html):
+        u = (m.group(0) or "").strip()
+        if u:
+            urls.append(_normalize_url(u, base_url))
+
+    # unique (preserve order)
     seen = set(); out = []
     for u in urls:
         if u not in seen:
@@ -285,19 +356,18 @@ async def resolve_public_video(url: str):
 
     # 3) HTML → หาคลู่วิดีโอ
     try:
-        html = await fetch_text(url)
+        html = await fetch_text(url)  # ← ไม่ต้อง referer ที่นี่
         cands = find_video_candidates(html, base_url=url)
         for cu in cands:
             h2 = hostof(cu)
             if is_blocked_host(h2):
-                # ผู้ให้บริการฝังวิดีโอจากโดเมนต้องห้าม → ปฏิเสธ
                 raise NotAllowed("โดเมนนี้ไม่รองรับ (เสี่ยง TOS/DRM)")
             try:
-                cct, _ = await http_head_ok(cu)
+                cct, _ = await http_head_ok(cu, referer=url)  # ← ใส่ referer เป็นหน้าต้นทาง
                 if cct.startswith("video/"):
                     return {"mode": "direct", "url": cu, "variants": None}
                 if is_hls_content_type(cct) or cu.lower().endswith(".m3u8"):
-                    text2 = await fetch_text(cu)
+                    text2 = await fetch_text(cu, referer=url)  # ← ใส่ referer
                     if hls_is_encrypted(text2):
                         continue
                     variants = parse_hls_master(text2, base_url=cu)
@@ -440,19 +510,18 @@ async def do_download_flow(ctx_like, link_msg: discord.Message, url: str):
     try:
         if fmt == "mp4":
             if mode == "direct":
-                await stream_download(selected_url, out_path)
+                await stream_download(selected_url, out_path, referer=source_page)
             else:
                 await download_hls_to_mp4(selected_url, out_path)
         else:
-            # โหมดลิงก์: default แปลงเป็น MP3
             if mode == "direct":
                 tmp = DOWNLOAD_DIR / (base_name if pathlib.Path(base_name).suffix.lower() in VIDEO_EXTS else base_name + ".mp4")
-                await stream_download(selected_url, tmp)
+                await stream_download(selected_url, tmp, referer=source_page)
                 await extract_audio_generic(str(tmp), out_path, "mp3")
                 try: tmp.unlink(missing_ok=True)
                 except: pass
             else:
-                await extract_audio_generic(selected_url, out_path, "mp3")
+                await extract_audio_generic(selected_url, out_path, "mp3", referer=source_page)
 
         size = out_path.stat().st_size
         if size <= MAX_DISCORD_BYTES:
