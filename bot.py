@@ -112,6 +112,12 @@ def s3_upload(local_path: pathlib.Path) -> str:
     s3.upload_file(str(local_path), S3_BUCKET, key, ExtraArgs={"ACL": "public-read"})
     return f"{S3_PUBLIC_BASE}/{key}"
 
+def is_hls_content_type(ct: str) -> bool:
+    ct = (ct or "").lower()
+    return ("application/x-mpegurl" in ct or
+            "application/vnd.apple.mpegurl" in ct or
+            ct == "audio/mpegurl")
+
 async def http_head_ok(url: str) -> Tuple[str, int]:
     async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
         r = await client.head(url)
@@ -208,9 +214,12 @@ async def download_hls_to_mp4(m3u8_url: str, out_path: pathlib.Path):
 # ---------- HTML candidates ----------
 VIDEO_CANDIDATE_PATTERNS = [
     r'<meta[^>]+property=["\']og:video["\'][^>]+content=["\']([^"\']+)["\']',
-    r'<meta[^>]+name=["\']og:video["\'][^>]+content=["\']([^"\']+)["\']',
+    r'<meta[^>]+property=["\']og:video:url["\'][^>]+content=["\']([^"\']+)["\']',
+    r'<meta[^>]+property=["\']og:video:secure_url["\'][^>]+content=["\']([^"\']+)["\']',
+    r'<meta[^>]+name=["\']twitter:player:stream["\'][^>]+content=["\']([^"\']+)["\']',
     r'<video[^>]+src=["\']([^"\']+)["\']',
-    r'<source[^>]+src=["\']([^"\']+)["\']',
+    r'<source[^>]+src=["\']([^"\']+)["\'][^>]*?(?:type=["\']video/[^"\']+["\'])?',
+    r'<link[^>]+rel=["\']preload["\'][^>]+as=["\']video["\'][^>]+href=["\']([^"\']+)["\']',
 ]
 def find_video_candidates(html: str, base_url: str) -> List[str]:
     html = html or ""
@@ -232,44 +241,58 @@ def find_video_candidates(html: str, base_url: str) -> List[str]:
 
 # ---------- Resolver ----------
 async def resolve_public_video(url: str):
-    """
-    Return dict:
-      {
-        "mode": "direct" | "m3u8",
-        "url": <final_url>,
-        "variants": Optional[List[HlsVariant]]  # when m3u8 master has multiple streams
-      }
-    """
     host = hostof(url)
     if any(b in host for b in BLOCKED_HOSTS):
         raise NotAllowed("โดเมนนี้ไม่รองรับ (เสี่ยง TOS/DRM)")
 
-    # direct file?
+    # 0) HEAD เช็คชนิดไฟล์ก่อน
+    try:
+        ct, _ = await http_head_ok(url)
+        if ct.startswith("video/"):
+            return {"mode": "direct", "url": url, "variants": None}
+        if is_hls_content_type(ct):
+            # อาจเป็น media playlist (.m3u8) แม้ URL ไม่ลงท้าย .m3u8
+            text = await fetch_text(url)
+            if hls_is_encrypted(text):
+                raise NotAllowed("พบการเข้ารหัสใน .m3u8 — ไม่รองรับ")
+            variants = parse_hls_master(text, base_url=url)
+            # ถ้าเป็น media playlist จะไม่มี STREAM-INF → ไม่มี variants ก็ยังโหลดได้
+            return {"mode": "m3u8", "url": url, "variants": variants or None}
+    except Exception:
+        # ถ้า HEAD ล้มเหลวก็ไปลำดับถัดไป
+        pass
+
+    # 1) นามสกุลไฟล์ตรง?
     if await is_direct_video(url):
         return {"mode": "direct", "url": url, "variants": None}
 
-    # m3u8?
+    # 2) HLS จากนามสกุล .m3u8
     path = urlparse(url).path.lower()
-    if path.endswith(".m3u8") or url.lower().endswith(".m3u8"):
+    if path.endswith(".m3u8"):
         text = await fetch_text(url)
         if hls_is_encrypted(text):
             raise NotAllowed("พบการเข้ารหัสใน .m3u8 — ไม่รองรับ")
         variants = parse_hls_master(text, base_url=url)
         return {"mode": "m3u8", "url": url, "variants": variants or None}
 
-    # HTML → og:video / <video>/<source>
+    # 3) HTML → หา og:video/<video>/<source>/twitter:player:stream
     try:
         html = await fetch_text(url)
         cands = find_video_candidates(html, base_url=url)
         for cu in cands:
-            if await is_direct_video(cu):
-                return {"mode": "direct", "url": cu, "variants": None}
-            if cu.lower().endswith(".m3u8"):
-                text2 = await fetch_text(cu)
-                if hls_is_encrypted(text2):
-                    continue
-                variants = parse_hls_master(text2, base_url=cu)
-                return {"mode": "m3u8", "url": cu, "variants": variants or None}
+            # ลอง HEAD ของ candidate ด้วยเผื่อเป็น HLS
+            try:
+                cct, _ = await http_head_ok(cu)
+                if cct.startswith("video/"):
+                    return {"mode": "direct", "url": cu, "variants": None}
+                if is_hls_content_type(cct) or cu.lower().endswith(".m3u8"):
+                    text2 = await fetch_text(cu)
+                    if hls_is_encrypted(text2):
+                        continue
+                    variants = parse_hls_master(text2, base_url=cu)
+                    return {"mode": "m3u8", "url": cu, "variants": variants or None}
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -350,8 +373,16 @@ class AudioExtSelect(discord.ui.View):
 
 # ---------- Core (link flow) ----------
 async def do_download_flow(ctx_like, link_msg: discord.Message, url: str):
-    # 1) Resolve
-    info = await resolve_public_video(url)
+    # 1) Resolve (จับ NotAllowed ให้ตอบกลับแทนการ error เงียบ)
+    try:
+        info = await resolve_public_video(url)
+    except NotAllowed as e:
+        await link_msg.reply(f"❌ โหลดไม่ได้: {e}", mention_author=False)
+        return
+    except Exception as e:
+        await link_msg.reply(f"❌ Error while resolving: {type(e).__name__}: {e}", mention_author=False)
+        return
+
     mode = info["mode"]
     variants: Optional[List[HlsVariant]] = info.get("variants")
 
