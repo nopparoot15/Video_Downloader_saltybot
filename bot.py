@@ -47,7 +47,11 @@ DEFAULT_HEADERS = {
 
 # ---------- Blocked domains (TOS/DRM risk) ----------
 BLOCKED_DOMAINS = {
-
+    # ตัวอย่างรายการเข้ม (ปรับได้ตามนโยบายคุณ)
+    # "youtube.com", "youtu.be", "twitch.tv", "vimeo.com",
+    # "netflix.com", "disneyplus.com", "primevideo.com", "hulu.com",
+    # "fansly.com", "onlyfans.com", "patreon.com", "crunchyroll.com",
+    # "spotify.com", "tidal.com", "deezer.com",
 }
 
 def hostof(url: str) -> str:
@@ -152,7 +156,8 @@ def is_hls_content_type(ct: str) -> bool:
 
 async def is_direct_video(url: str) -> bool:
     try:
-        ct, _ = await http_head_ok(url)
+        # ส่ง referer เป็นตัวเอง ช่วยผ่าน 403/anti-hotlink
+        ct, _ = await http_head_ok(url, referer=url)
         if ct.startswith("video/"):
             return True
         suffix = pathlib.Path(urlparse(url).path).suffix.lower()
@@ -263,6 +268,14 @@ FALLBACK_MEDIA_URL_RE = re.compile(
     r'((?:https?:)?//[^\s"\'<>]+?\.(?:m3u8|mp4|webm|mov)(?:\?[^\s"\'<>]*)?|/[^\s"\'<>]+?\.(?:m3u8|mp4|webm|mov)(?:\?[^\s"\'<>]*)?)',
     re.I
 )
+ANY_URL_RE = re.compile(r'https?://[^\s"\'<>]+', re.I)
+
+def looks_like_media_url(u: str) -> bool:
+    lu = u.lower()
+    return (
+        any(x in lu for x in (".m3u8", ".mp4", ".webm", ".mov")) or
+        any(x in lu for x in ("/hls", "/dash", "manifest", "playlist"))
+    )
 
 def _normalize_url(u: str, base_url: str) -> str:
     u = (u or "").strip()
@@ -327,13 +340,13 @@ async def resolve_public_video(url: str):
     if is_blocked_host(host):
         raise NotAllowed("โดเมนนี้ไม่รองรับ (เสี่ยง TOS/DRM)")
 
-    # 0) HEAD เช็คชนิดไฟล์ก่อน
+    # 0) HEAD เช็คชนิดไฟล์ก่อน (ใส่ referer=url)
     try:
-        ct, _ = await http_head_ok(url)
+        ct, _ = await http_head_ok(url, referer=url)
         if ct.startswith("video/"):
             return {"mode": "direct", "url": url, "variants": None}
         if is_hls_content_type(ct):
-            text = await fetch_text(url)
+            text = await fetch_text(url, referer=url)
             if hls_is_encrypted(text):
                 raise NotAllowed("พบการเข้ารหัสใน .m3u8 — ไม่รองรับ")
             variants = parse_hls_master(text, base_url=url)
@@ -348,7 +361,7 @@ async def resolve_public_video(url: str):
     # 2) HLS จากนามสกุล .m3u8
     path = urlparse(url).path.lower()
     if path.endswith(".m3u8"):
-        text = await fetch_text(url)
+        text = await fetch_text(url, referer=url)
         if hls_is_encrypted(text):
             raise NotAllowed("พบการเข้ารหัสใน .m3u8 — ไม่รองรับ")
         variants = parse_hls_master(text, base_url=url)
@@ -356,12 +369,46 @@ async def resolve_public_video(url: str):
 
     # 3) HTML → หาคลู่วิดีโอ
     try:
-        html = await fetch_text(url)
+        html = await fetch_text(url, referer=url)
         cands = find_video_candidates(html, base_url=url)
         for cu in cands:
             h2 = hostof(cu)
             if is_blocked_host(h2):
                 raise NotAllowed("โดเมนนี้ไม่รองรับ (เสี่ยง TOS/DRM)")
+            try:
+                cct, _ = await http_head_ok(cu, referer=url)
+                if cct.startswith("video/"):
+                    return {"mode": "direct", "url": cu, "variants": None}
+                if is_hls_content_type(cct) or cu.lower().endswith(".m3u8"):
+                    text2 = await fetch_text(cu, referer=url)
+                    if hls_is_encrypted(text2):
+                        continue
+                    variants = parse_hls_master(text2, base_url=cu)
+                    return {"mode": "m3u8", "url": cu, "variants": variants or None}
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 4) Aggressive fallback: เก็บ URL ทั้งหน้าแล้ว HEAD คัดเอง
+    try:
+        if 'html' not in locals():
+            html = await fetch_text(url, referer=url)
+        urls_guess = [m.group(0) for m in ANY_URL_RE.finditer(html)]
+        urls_guess = [_normalize_url(u, url) for u in urls_guess if looks_like_media_url(u)]
+
+        # จำกัดจำนวนตรวจเพื่อความเร็ว
+        seen = set(); pruned = []
+        for u in urls_guess:
+            if u not in seen:
+                seen.add(u); pruned.append(u)
+            if len(pruned) >= 60:
+                break
+
+        for cu in pruned:
+            h2 = hostof(cu)
+            if is_blocked_host(h2):
+                continue
             try:
                 cct, _ = await http_head_ok(cu, referer=url)
                 if cct.startswith("video/"):
@@ -587,6 +634,44 @@ async def fetch_cmd(ctx: commands.Context, url: Optional[str] = None):
         return
 
     await do_download_flow(ctx, link_msg, u)
+
+@bot.command(name="fetchdiag")
+@require_allowed_channel()
+async def fetchdiag(ctx: commands.Context, url: str):
+    try:
+        host = hostof(url)
+        ok0, ct0, cl0 = True, "", 0
+        try:
+            ct0, cl0 = await http_head_ok(url, referer=url)
+        except Exception as e:
+            ok0, ct0 = False, f"ERR:{type(e).__name__}"
+
+        path = urlparse(url).path.lower()
+        ext = pathlib.Path(path).suffix.lower()
+        direct_by_ext = ext in {".mp4",".mov",".webm",".mkv",".m4v",".ts"}
+        direct_by_head = ct0.startswith("video/")
+        hls_by_ct = is_hls_content_type(ct0)
+        hls_by_ext = path.endswith(".m3u8")
+
+        cand_cnt = 0; cand_preview = []
+        try:
+            html = await fetch_text(url, referer=url)
+            cands = find_video_candidates(html, base_url=url)
+            cand_cnt = len(cands); cand_preview = cands[:3]
+        except Exception as e:
+            cand_cnt = -1; cand_preview = [f"ERR:{type(e).__name__}"]
+
+        await ctx.reply(
+            f"**Diag** `{url}`\n"
+            f"- host=`{host}` blocked=`{is_blocked_host(host)}`\n"
+            f"- HEAD ok=`{ok0}` ct=`{ct0}` size=`{cl0}`\n"
+            f"- ext=`{ext}` direct_by_ext=`{direct_by_ext}` direct_by_head=`{direct_by_head}`\n"
+            f"- hls_by_ct=`{hls_by_ct}` hls_by_ext=`{hls_by_ext}`\n"
+            f"- html_candidates=`{cand_cnt}` -> {cand_preview}",
+            mention_author=False
+        )
+    except Exception as e:
+        await ctx.reply(f"diag error: {type(e).__name__}: {e}", mention_author=False)
 
 # ---------- Attachment flow: drop .mp4 -> ask audio ext -> convert ----------
 class _DummyCtx:
